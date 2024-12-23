@@ -279,28 +279,32 @@ class LLaVATrainer(Trainer):
 
         model.train()
         inputs = self._prepare_inputs(inputs)
-
+        _log_caption = (self.state.global_step % self.state.logging_steps == 0 and self.current_accumulation_step == 0)
         with self.compute_loss_context_manager():
-            loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+            if _log_caption:
+                loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+            else:
+                loss = self.compute_loss(model, inputs, return_outputs=False)
 
         # Decode and print
-        if self.state.global_step % self.state.logging_steps == 0 or self.state.global_step == 1:  # Only print every 100 steps
+
+        if _log_caption:  # Only print every 100 steps
             # Get predictions
             logits = outputs.logits               # Shape: [batch_size, seq_len, vocab_size]
             predictions = torch.argmax(logits, dim=-1)  # Shape: [batch_size, seq_len]
-            
             # Take first sequence from batch as example
-            input_ids = inputs["input_ids"][0]    # Shape: [seq_len]
             pred_ids = predictions[0]             # Shape: [seq_len]
             print("\nStep:", self.state.global_step)
-            print("\nInput:", self.tokenizer.decode(input_ids))
-            print("\nPrediction:", self.tokenizer.decode(pred_ids))
+            print("\nPrediction:", self.tokenizer.decode(pred_ids, skip_special_tokens=True))
             print("\nLoss:", loss.item())
+
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
         self.accelerator.backward(loss)
+        self.current_accumulation_step = (self.current_accumulation_step + 1) % self.args.gradient_accumulation_steps
 
         return loss.detach() / self.args.gradient_accumulation_steps
+
 
