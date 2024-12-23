@@ -12,7 +12,57 @@ from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
     logger,
 )
-from typing import List, Optional
+from typing import List, Optional, Dict, Union, Any
+
+from transformers.utils import (
+    ADAPTER_CONFIG_NAME,
+    ADAPTER_SAFE_WEIGHTS_NAME,
+    ADAPTER_WEIGHTS_NAME,
+    CONFIG_NAME,
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    WEIGHTS_INDEX_NAME,
+    WEIGHTS_NAME,
+    XLA_FSDPV2_MIN_VERSION,
+    PushInProgress,
+    PushToHubMixin,
+    can_return_loss,
+    find_labels,
+    is_accelerate_available,
+    is_apex_available,
+    is_bitsandbytes_available,
+    is_datasets_available,
+    is_galore_torch_available,
+    is_grokadamw_available,
+    is_in_notebook,
+    is_ipex_available,
+    is_liger_kernel_available,
+    is_lomo_available,
+    is_peft_available,
+    is_safetensors_available,
+    is_sagemaker_dp_enabled,
+    is_sagemaker_mp_enabled,
+    is_schedulefree_available,
+    is_torch_compile_available,
+    is_torch_mlu_available,
+    is_torch_mps_available,
+    is_torch_musa_available,
+    is_torch_neuroncore_available,
+    is_torch_npu_available,
+    is_torch_xla_available,
+    is_torch_xpu_available,
+    is_torchao_available,
+    logging,
+    strtobool,
+)
+
+from transformers.training_args import OptimizerNames
+
+if is_in_notebook():
+    from transformers.utils.notebook import NotebookProgressCallback
+
+    DEFAULT_PROGRESS_CALLBACK = NotebookProgressCallback
+
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -253,3 +303,83 @@ class LLaVATrainer(Trainer):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+    def training_step(
+        self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None
+    ) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+
+        inputs = self._prepare_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            loss, outputs = self.compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+
+         
+
+        # Decode and print
+        if self.state.global_step % self.state.logging_steps == 0 or self.state.global_step == 1:  # Only print every 100 steps
+            # Get predictions
+            logits = outputs.logits               # Shape: [batch_size, seq_len, vocab_size]
+            predictions = torch.argmax(logits, dim=-1)  # Shape: [batch_size, seq_len]
+            
+            # Take first sequence from batch as example
+            input_ids = inputs["input_ids"][0]    # Shape: [seq_len]
+            pred_ids = predictions[0]             # Shape: [seq_len]
+            print("\nStep:", self.state.global_step)
+            print("\nInput:", self.tokenizer.decode(input_ids))
+            print("\nPrediction:", self.tokenizer.decode(pred_ids))
+            print("\nLoss:", loss.item())
+        
+        del inputs
+
+        if (
+            self.args.torch_empty_cache_steps is not None
+            and self.state.global_step % self.args.torch_empty_cache_steps == 0
+        ):
+            if is_torch_xpu_available():
+                torch.xpu.empty_cache()
+            elif is_torch_mlu_available():
+                torch.mlu.empty_cache()
+            elif is_torch_musa_available():
+                torch.musa.empty_cache()
+            elif is_torch_npu_available():
+                torch.npu.empty_cache()
+            elif is_torch_mps_available(min_version="2.0"):
+                torch.mps.empty_cache()
+            else:
+                torch.cuda.empty_cache()
+
+        kwargs = {}
+
+        # For LOMO optimizers you need to explicitly use the learnign rate
+        if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+            kwargs["learning_rate"] = self._get_learning_rate()
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        self.accelerator.backward(loss, **kwargs)
+        # Finally we need to normalize the loss for reporting
+        if num_items_in_batch is None:
+            return loss.detach() / self.args.gradient_accumulation_steps
+        return loss.detach()
+
